@@ -1,0 +1,356 @@
+#!/bin/bash
+
+# ============================================================================
+# Peel Back - Peel back the layers of URL redirects to reveal the true destination
+# ============================================================================
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Defaults
+VERBOSE=0
+MAX_REDIRECTS=30
+TIMEOUT=10
+SHOW_HEADERS=0
+JSON_OUTPUT=0
+FILE_INPUT=""
+URLS=()
+READ_STDIN=0
+USER_AGENT="Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+HDR_ARGS=(-H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.5" -H "Connection: keep-alive")
+
+# ---- Core Functions ----
+
+usage() {
+    echo -e "${BOLD}Peel Back${NC} - Reveal the true destination behind any URL"
+    echo ""
+    echo -e "${BOLD}Usage:${NC}"
+    echo "  $(basename "$0") [OPTIONS] <url>"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -v, --verbose       Show full redirect chain with status codes"
+    echo "  -f, --file <file>   Resolve all URLs in a file (one per line)"
+    echo "  -m, --max <num>     Max redirects to follow (default: $MAX_REDIRECTS)"
+    echo "  -t, --timeout <sec> Connection timeout in seconds (default: $TIMEOUT)"
+    echo "  -H, --headers       Show response headers of final destination"
+    echo "  -j, --json          Output in JSON format"
+    echo "  -  ,                Read URL(s) from stdin"
+    echo "  -h, --help          Show this help message"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  peelback https://bit.ly/abc123"
+    echo "  peelback -v https://t.co/xyz789"
+    echo "  peelback -f urls.txt"
+    echo "  echo 'https://bit.ly/abc' | peelback -"
+    echo ""
+    echo "Version 1.0"
+    echo "Copyright (c) 2026, Chris McGimpsey-Jones. chrismcgimpseyjones@duck.com"
+    echo ""
+    exit 0
+}
+
+check_dependencies() {
+    if ! command -v curl &> /dev/null; then
+        echo -e "${RED}Error: 'curl' is required but not installed.${NC}"
+        echo "Install it with: sudo apt install curl"
+        exit 1
+    fi
+}
+
+normalize_url() {
+    local url="$1"
+    url="$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -z "$url" ]]; then
+        echo ""
+        return
+    fi
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        url="https://$url"
+    fi
+    echo "$url"
+}
+
+# Extract soft redirect URL from HTML body
+# Handles: meta refresh, JavaScript window.location, t.co title tags, og:url, canonical
+extract_soft_redirect() {
+    local body="$1"
+    local found_url=""
+    local patterns=(
+        'content=["\x27]\d+;\s*[Uu][Rr][Ll]=\K[^"\x27; >]+'
+        'window\.location\.href\s*=\s*["\x27]\K[^"\x27]+'
+        'window\.location\.replace\$\s*["\x27]\K[^"\x27]+'
+        'window\.location\s*=\s*["\x27]\K[^"\x27]+'
+        '<title>\s*\Khttps?://[^<\s]+'
+        'property=["\x27]og:url["\x27][^>]*content=["\x27]\K[^"\x27]+'
+        'rel=["\x27]canonical["\x27][^>]*href=["\x27]\K[^"\x27]+'
+    )
+
+    for pattern in "${patterns[@]}"; do
+        found_url=$(echo "$body" | grep -oPi "$pattern" | head -1)
+        if [[ -n "$found_url" ]]; then
+            echo "$found_url"
+            return
+        fi
+    done
+    echo ""
+}
+
+# Fetch URL - saves headers, body, and metadata to temp directory
+curl_fetch() {
+    local url="$1"
+    local tmpdir="$2"
+
+    curl -sSL -D "$tmpdir/headers" \
+        --max-redirs "$MAX_REDIRECTS" \
+        --connect-timeout "$TIMEOUT" \
+        --max-time $((TIMEOUT * MAX_REDIRECTS)) \
+        -A "$USER_AGENT" \
+        "${HDR_ARGS[@]}" \
+        -w "__FINAL_URL__:%{url_effective}\n__FINAL_CODE__:%{http_code}\n__NUM_REDIRECTS__:%{num_redirects}\n" \
+        -o "$tmpdir/body" \
+        "$url" 2>/dev/null > "$tmpdir/meta"
+}
+
+# Follow a soft redirect URL to its final destination
+follow_soft_url() {
+    local soft_url="$1"
+
+    curl -sSL -o /dev/null \
+        --max-redirs "$MAX_REDIRECTS" \
+        --connect-timeout "$TIMEOUT" \
+        -A "$USER_AGENT" \
+        "${HDR_ARGS[@]}" \
+        -w "%{url_effective}|%{http_code}|%{num_redirects}" \
+        "$soft_url" 2>/dev/null
+}
+
+# ---- Resolve Functions ----
+
+resolve_url_verbose() {
+    local url="$1"
+    local step=0
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    echo -e "${BOLD}${CYAN}Peeling:${NC} $url"
+    echo -e "${CYAN}─────────────────────────────────────────────────${NC}"
+
+    curl_fetch "$url" "$tmpdir"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Error: Failed to peel back URL.${NC}"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Parse redirect chain from headers
+    local current_url="$url"
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^HTTP/[0-9.]+" "([0-9]+) ]]; then
+            local code="${BASH_REMATCH[1]}"
+            local color="$GREEN"
+            [[ "$code" =~ ^3 ]] && color="$YELLOW"
+            [[ "$code" =~ ^[45] ]] && color="$RED"
+            echo -e "  ${BOLD}Layer $step:${NC} ${color}[$code]${NC} $current_url"
+            ((step++))
+        fi
+        if [[ "$line" =~ ^[Ll]ocation:" "*(.+)$ ]]; then
+            current_url="$(echo "${BASH_REMATCH[1]}" | tr -d '\r')"
+        fi
+    done < "$tmpdir/headers"
+
+    # Extract metadata
+    local final_url final_code num_redirects
+    final_url=$(grep "^__FINAL_URL__:" "$tmpdir/meta" | cut -d: -f2-)
+    final_code=$(grep "^__FINAL_CODE__:" "$tmpdir/meta" | cut -d: -f2-)
+    num_redirects=$(grep "^__NUM_REDIRECTS__:" "$tmpdir/meta" | cut -d: -f2-)
+
+    # Check for soft redirects in the body
+    local soft_url=""
+    if [[ -f "$tmpdir/body" ]]; then
+        soft_url=$(extract_soft_redirect "$(cat "$tmpdir/body")")
+    fi
+
+    if [[ -n "$soft_url" && "$soft_url" != "$final_url" ]]; then
+        echo -e "  ${BOLD}Layer $step:${NC} ${YELLOW}[soft redirect]${NC} $final_url"
+        ((step++))
+
+        local soft_result deep_url deep_code deep_redirects
+        soft_result=$(follow_soft_url "$soft_url")
+        deep_url=$(echo "$soft_result" | awk -F'|' '{print $1}')
+        deep_code=$(echo "$soft_result" | awk -F'|' '{print $2}')
+        deep_redirects=$(echo "$soft_result" | awk -F'|' '{print $3}')
+
+        if [[ "$deep_redirects" -gt 0 ]]; then
+            echo -e "  ${BOLD}Layer $step:${NC} ${YELLOW}[→ $deep_redirects more]${NC} $soft_url"
+            ((step++))
+        fi
+
+        final_url="$deep_url"
+        final_code="$deep_code"
+        num_redirects=$((num_redirects + 1 + deep_redirects))
+    fi
+
+    echo -e "${CYAN}─────────────────────────────────────────────────${NC}"
+    echo -e "${BOLD}${GREEN}Core URL:${NC}     $final_url"
+    echo -e "${BOLD}Status Code:${NC}  $final_code"
+    echo -e "${BOLD}Layers:${NC}       $num_redirects"
+    echo ""
+    rm -rf "$tmpdir"
+}
+
+resolve_url_simple() {
+    local url="$1"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    curl_fetch "$url" "$tmpdir"
+    if [[ $? -ne 0 ]]; then
+        # Retry with relaxed SSL
+        curl -sSLk -D "$tmpdir/headers" \
+            --max-redirs "$MAX_REDIRECTS" \
+            --connect-timeout "$TIMEOUT" \
+            --max-time $((TIMEOUT * MAX_REDIRECTS)) \
+            -A "$USER_AGENT" \
+            "${HDR_ARGS[@]}" \
+            -w "__FINAL_URL__:%{url_effective}\n__FINAL_CODE__:%{http_code}\n__NUM_REDIRECTS__:%{num_redirects}\n" \
+            -o "$tmpdir/body" \
+            "$url" 2>/dev/null > "$tmpdir/meta"
+
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}Error peeling:${NC} $url"
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    fi
+
+    local final_url http_code num_redirects
+    final_url=$(grep "^__FINAL_URL__:" "$tmpdir/meta" | cut -d: -f2-)
+    http_code=$(grep "^__FINAL_CODE__:" "$tmpdir/meta" | cut -d: -f2-)
+    num_redirects=$(grep "^__NUM_REDIRECTS__:" "$tmpdir/meta" | cut -d: -f2-)
+
+    # Check for soft redirects
+    local soft_url=""
+    local soft_type=""
+    if [[ -f "$tmpdir/body" ]]; then
+        soft_url=$(extract_soft_redirect "$(cat "$tmpdir/body")")
+    fi
+
+    if [[ -n "$soft_url" && "$soft_url" != "$final_url" ]]; then
+        soft_type="js/meta"
+        local soft_result deep_url deep_code deep_redirects
+        soft_result=$(follow_soft_url "$soft_url")
+        deep_url=$(echo "$soft_result" | awk -F'|' '{print $1}')
+        deep_code=$(echo "$soft_result" | awk -F'|' '{print $2}')
+        deep_redirects=$(echo "$soft_result" | awk -F'|' '{print $3}')
+        final_url="$deep_url"
+        http_code="$deep_code"
+        num_redirects=$((num_redirects + 1 + deep_redirects))
+    fi
+
+    rm -rf "$tmpdir"
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        local soft_json="false"
+        [[ -n "$soft_type" ]] && soft_json="true"
+        echo "{\"original\":\"$url\",\"resolved\":\"$final_url\",\"status\":$http_code,\"layers\":$num_redirects,\"soft_redirect\":$soft_json}"
+    else
+        if [[ "$num_redirects" -gt 0 ]]; then
+            local extra=""
+            [[ -n "$soft_type" ]] && extra=" + $soft_type redirect"
+            echo -e "${YELLOW}$url${NC}"
+            echo -e "  ${GREEN}→ $final_url${NC}  ${CYAN}[$http_code, $num_redirects layer(s) peeled${extra}]${NC}"
+        else
+            echo -e "${GREEN}$url${NC}"
+            echo -e "  ${CYAN}(nothing to peel, status: $http_code)${NC}"
+        fi
+    fi
+}
+
+# ---- Helper Functions ----
+
+show_final_headers() {
+    local url="$1"
+    echo -e "\n${BOLD}${CYAN}Core Destination Headers:${NC}"
+    echo -e "${CYAN}───────────────────────────────────────${NC}"
+    curl -sSL -D - -o /dev/null \
+        --max-redirs "$MAX_REDIRECTS" \
+        --connect-timeout "$TIMEOUT" \
+        -A "$USER_AGENT" \
+        "$url" 2>/dev/null | head -30
+    echo ""
+}
+
+process_url() {
+    local url
+    url=$(normalize_url "$1")
+    [[ -z "$url" ]] && return
+
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        resolve_url_verbose "$url"
+    else
+        resolve_url_simple "$url"
+    fi
+
+    if [[ "$SHOW_HEADERS" -eq 1 ]]; then
+        show_final_headers "$url"
+    fi
+}
+
+# ---- Main ----
+
+check_dependencies
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)   VERBOSE=1; shift ;;
+        -f|--file)      FILE_INPUT="$2"; shift 2 ;;
+        -m|--max)       MAX_REDIRECTS="$2"; shift 2 ;;
+        -t|--timeout)   TIMEOUT="$2"; shift 2 ;;
+        -H|--headers)   SHOW_HEADERS=1; shift ;;
+        -j|--json)      JSON_OUTPUT=1; shift ;;
+        -h|--help)      usage ;;
+        -)              READ_STDIN=1; shift ;;
+        -*)             echo -e "${RED}Unknown: $1${NC}"; usage ;;
+        *)              URLS+=("$1"); shift ;;
+    esac
+done
+
+if [[ "$READ_STDIN" -eq 1 ]]; then
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && process_url "$line"
+    done
+elif [[ -n "$FILE_INPUT" ]]; then
+    if [[ ! -f "$FILE_INPUT" ]]; then
+        echo -e "${RED}File not found: $FILE_INPUT${NC}"
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        process_url "$line"
+    done < "$FILE_INPUT"
+elif [[ ${#URLS[@]} -gt 0 ]]; then
+    for url in "${URLS[@]}"; do
+        process_url "$url"
+    done
+else
+    echo -e "${BOLD}${CYAN}╔═══════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║      🍌 Peel Back         ║${NC}"
+    echo -e "${BOLD}${CYAN}║  Reveal what's under      ║${NC}"
+    echo -e "${BOLD}${CYAN}║  any URL                  ║${NC}"
+    echo -e "${BOLD}${CYAN}╚═══════════════════════════╝${NC}"
+    echo -e "Paste a URL and press Enter"
+    echo -e "(Ctrl+C to quit)\n"
+    while true; do
+        echo -ne "${BOLD}peel> ${NC}"
+        read -r input_url
+        if [[ -n "$input_url" ]]; then
+            process_url "$input_url"
+            echo ""
+        fi
+    done
+fi
