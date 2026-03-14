@@ -15,7 +15,7 @@ This makes it ideal for investigating shortened links, tracking redirects, or ve
 
 ## Example
 
-![Peel Back demo](images/demo.png)
+![Peel Back demo](demo/demo.webp)
 
 
 ## Features
@@ -40,24 +40,35 @@ Most Linux systems already include both.
 
 If curl is missing:
 
-sudo apt install curl
+boxforge install curl
 
 
 ## Installation
 
-Option 1 — Manual install
+Option 1 — ScriptForge
 
-git clone https://github.com/YOURNAME/peelback.git
-cd peelback
-chmod +x peelback
-sudo cp peelback /usr/local/bin/
+scriptforge
+/home/yourname/
+
+Select peelback for installation to /usr/bin/peelback
 
 Then run:
 
 peelback https://example.com
 
 
-Option 2 — Run locally
+Option 2 — Manual install
+
+git clone https://github.com/fpucore/peelback.git
+cd peelback
+chmod +x peelback
+
+Then run:
+
+./peelback https://example.com
+
+
+Option 3 — Run locally
 
 chmod +x peelback
 ./peelback https://example.com
@@ -99,11 +110,15 @@ peelback -v https://t.co/example
 Example output:
 
 Peeling: https://t.co/example
+
 ────────────────────────────────────────
+
 Layer 0: [301] https://t.co/example
 Layer 1: [302] https://example.org/redirect
 Layer 2: [200] https://example.com/article
+
 ────────────────────────────────────────
+
 Core URL:     https://example.com/article
 Status Code:  200
 Layers:       2
