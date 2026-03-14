@@ -20,7 +20,6 @@ SHOW_HEADERS=0
 JSON_OUTPUT=0
 FILE_INPUT=""
 URLS=()
-READ_STDIN=0
 USER_AGENT="Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 HDR_ARGS=(-H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.5" -H "Connection: keep-alive")
 
@@ -39,16 +38,14 @@ usage() {
     echo "  -t, --timeout <sec> Connection timeout in seconds (default: $TIMEOUT)"
     echo "  -H, --headers       Show response headers of final destination"
     echo "  -j, --json          Output in JSON format"
-    echo "  -  ,                Read URL(s) from stdin"
     echo "  -h, --help          Show this help message"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  peelback https://bit.ly/abc123"
     echo "  peelback -v https://t.co/xyz789"
     echo "  peelback -f urls.txt"
-    echo "  echo 'https://bit.ly/abc' | peelback -"
     echo ""
-    echo "Version 1.0"
+    echo "Version 1.1"
     echo "Copyright (c) 2026, Chris McGimpsey-Jones. chrismcgimpseyjones@duck.com"
     echo ""
     exit 0
@@ -257,7 +254,13 @@ resolve_url_simple() {
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
         local soft_json="false"
         [[ -n "$soft_type" ]] && soft_json="true"
-        echo "{\"original\":\"$url\",\"resolved\":\"$final_url\",\"status\":$http_code,\"layers\":$num_redirects,\"soft_redirect\":$soft_json}"
+        echo "{"
+        echo "\"original\":\"$url\","
+        echo "\"resolved\":\"$final_url\","
+        echo "\"status\":$http_code,"
+        echo "\"layers\":$num_redirects,"
+        echo "\"soft_redirect\":$soft_json"
+        echo "}"
     else
         if [[ "$num_redirects" -gt 0 ]]; then
             local extra=""
@@ -314,17 +317,12 @@ while [[ $# -gt 0 ]]; do
         -H|--headers)   SHOW_HEADERS=1; shift ;;
         -j|--json)      JSON_OUTPUT=1; shift ;;
         -h|--help)      usage ;;
-        -)              READ_STDIN=1; shift ;;
         -*)             echo -e "${RED}Unknown: $1${NC}"; usage ;;
         *)              URLS+=("$1"); shift ;;
     esac
 done
 
-if [[ "$READ_STDIN" -eq 1 ]]; then
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && process_url "$line"
-    done
-elif [[ -n "$FILE_INPUT" ]]; then
+if [[ -n "$FILE_INPUT" ]]; then
     if [[ ! -f "$FILE_INPUT" ]]; then
         echo -e "${RED}File not found: $FILE_INPUT${NC}"
         exit 1

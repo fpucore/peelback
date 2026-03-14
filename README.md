@@ -13,9 +13,11 @@ It follows both server-side redirects (HTTP 3xx responses) and client-side redir
 This makes it ideal for investigating shortened links, tracking redirects, or verifying where a link actually leads.
 
 
+
 ## Example
 
 ![Peel Back demo](demo/demo.webp)
+
 
 
 ## Features
@@ -31,6 +33,7 @@ This makes it ideal for investigating shortened links, tracking redirects, or ve
 - Fast and lightweight (Bash + curl only)
 
 
+
 ## Requirements
 
 - Bash
@@ -38,9 +41,11 @@ This makes it ideal for investigating shortened links, tracking redirects, or ve
 
 Most Linux systems already include both.
 
+
 If curl is missing:
 
 boxforge install curl
+
 
 
 ## Installation
@@ -80,6 +85,7 @@ chmod +x peelback
 ./peelback https://example.com
 
 
+
 ## Usage
 
 peelback [OPTIONS] <url>
@@ -93,8 +99,8 @@ peelback [OPTIONS] <url>
 -t, --timeout <sec>  Connection timeout in seconds (default: 10)  
 -H, --headers        Show response headers from the final destination  
 -j, --json           Output results in JSON format  
-- ,                  Read URLs from stdin  
 -h, --help           Show help message  
+
 
 
 ## Examples
@@ -106,7 +112,9 @@ peelback https://bit.ly/abc123
 Example output:
 
 https://bit.ly/abc123
+
   → https://example.com/article  [200, 3 layer(s) peeled]
+
 
 
 Show the full redirect chain
@@ -134,6 +142,7 @@ Status Code:  200
 Layers:       2
 
 
+
 Resolve URLs from a file
 
 urls.txt
@@ -149,6 +158,7 @@ Run:
 peelback -f urls.txt
 
 
+
 Pipe URLs into Peel Back
 
 echo "https://bit.ly/abc" | peelback -
@@ -158,6 +168,7 @@ or
 cat urls.txt | peelback -
 
 
+
 JSON output for scripts
 
 peelback -j https://bit.ly/abc
@@ -165,17 +176,25 @@ peelback -j https://bit.ly/abc
 Example output:
 
 {
+
   "original":"https://bit.ly/abc",
+
   "resolved":"https://example.com/article",
+
   "status":200,
+
   "layers":3,
+
   "soft_redirect":false
+
 }
+
 
 
 Show final response headers
 
 peelback -H https://bit.ly/abc
+
 
 
 ## How It Works
@@ -187,6 +206,7 @@ Peel Back uses curl to:
 3. Detect client-side redirects embedded in HTML
 4. Continue resolving until the true destination is reached
 
+
 Soft redirects are detected using pattern matching for:
 
 - meta refresh
@@ -194,6 +214,7 @@ Soft redirects are detected using pattern matching for:
 - og:url
 - canonical
 - redirect titles used by some services
+
 
 
 ## Use Cases
@@ -208,9 +229,11 @@ Peel Back is useful for:
 - Understanding complex redirect chains
 
 
+
 ## License
 
 MIT License
+
 
 
 ## Author
