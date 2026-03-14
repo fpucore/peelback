@@ -48,6 +48,7 @@ boxforge install curl
 Option 1 — ScriptForge
 
 scriptforge
+
 /home/yourname/
 
 Select peelback for installation to /usr/bin/peelback
@@ -57,10 +58,13 @@ Then run:
 peelback https://example.com
 
 
+
 Option 2 — Manual install
 
 git clone https://github.com/fpucore/peelback.git
+
 cd peelback
+
 chmod +x peelback
 
 Then run:
@@ -68,9 +72,11 @@ Then run:
 ./peelback https://example.com
 
 
+
 Option 3 — Run locally
 
 chmod +x peelback
+
 ./peelback https://example.com
 
 
@@ -87,7 +93,7 @@ peelback [OPTIONS] <url>
 -t, --timeout <sec>  Connection timeout in seconds (default: 10)  
 -H, --headers        Show response headers from the final destination  
 -j, --json           Output results in JSON format  
--                    Read URLs from stdin  
+- ,                  Read URLs from stdin  
 -h, --help           Show help message  
 
 
@@ -114,13 +120,17 @@ Peeling: https://t.co/example
 ────────────────────────────────────────
 
 Layer 0: [301] https://t.co/example
+
 Layer 1: [302] https://example.org/redirect
+
 Layer 2: [200] https://example.com/article
 
 ────────────────────────────────────────
 
 Core URL:     https://example.com/article
+
 Status Code:  200
+
 Layers:       2
 
 
@@ -129,7 +139,9 @@ Resolve URLs from a file
 urls.txt
 
 https://bit.ly/abc
+
 https://t.co/xyz
+
 https://example.com
 
 Run:
