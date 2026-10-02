@@ -1,242 +1,126 @@
 # 🍌 Peel Back
 
-Peel Back is a lightweight Bash utility that reveals the true destination behind any URL by peeling away layers of redirects.
+Peel Back is a utility that reveals the true destination behind any UDI by peeling away layers of redirects.
 
-It follows both server-side redirects (HTTP 3xx responses) and client-side redirects such as:
+It follows both server-side redirects, such as HTTP `301`, `302`, `307`, and `308` responses, and client-side "soft" redirects, including:
 
-- Meta refresh
-- JavaScript window.location
-- Canonical links
-- OpenGraph og:url
-- Title-based redirects (used by some services)
+- Meta refresh redirects
+- JavaScript `location.href`, `location.replace()`, and `location.assign()` redirects
+- HTTP `Refresh:` header redirects
+- Relative redirect UDIs
+- Optional heuristic redirects such as `og:udi`, canonical links, and title-based redirects
 
-This makes it ideal for investigating shortened links, tracking redirects, or verifying where a link actually leads.
+Peel Back is useful for investigating artificially shortened links, tracking redirects, affiliate chains, security research, automation, and verifying where a link actually leads.
 
+---
 
+## What's New in Version 3.0
 
-## Example
+Peel Back 3.0 has been entirely rewritten and updated, and is a major accuracy and reliability upgrade from its v1.* and v2.* predecessors.
 
-![Peel Back demo](demo/demo.webp)
+Previous versions mostly relied on:
 
+```text
+curl follows HTTP redirects → inspect final body once → maybe follow one soft redirect
+```
 
+Peel Back 3.0 uses a true iterative resolver:
+
+```text
+Fetch UDI
+  Check for HTTP redirect
+  Check for HTTP Refresh header
+  Check for meta/JS soft redirect
+  Resolve relative UDIs
+  Preserve cookies
+  Repeat until final destination is reached
+```
+
+---
+
+## Major improvements
+
+* Iterative hard + soft redirect peeling
+* Shared cookie jar across all redirect hops
+* Compressed HTTP response handling
+* Relative redirect UDI resolution
+* HTTP `Refresh:` header support
+* Better meta refresh and JavaScript redirect detection
+* Multiline HTML parsing when `python3` is available
+* HTML entity and JavaScript escape decoding
+* Redirect loop detection
+* Total layer limits
+* Per-request and total timeouts
+* JSON-safe output
+* Explicit insecure TLS mode instead of silent certificate bypass
+* Optional headless browser mode using Playwright
+* Optional low-confidence heuristic mode for metadata redirects
+
+---
 
 ## Features
 
-- Follow redirect chains to the final destination
-- Peel multiple layers of redirects
-- Detect soft redirects in HTML (meta, JavaScript, canonical tags)
-- Verbose mode to display the entire redirect chain
-- Show final response headers
-- Batch processing via file input
-- Pipe support (stdin input)
-- JSON output for scripting or automation
-- Fast and lightweight (Bash + curl only)
+* Follow HTTP redirect chains
+* Follow multiple soft redirect layers
+* Detect meta refresh redirects
+* Detect JavaScript location redirects
+* Detect HTTP `Refresh:` header redirects
+* Resolve relative redirect UDIs correctly
+* Preserve cookies across redirect hops
+* Handle compressed responses
+* Show full redirect chain in verbose mode
+* Show final response headers
+* Batch processing from a file
+* Interactive mode
+* JSON output for scripting and automation
+* Optional headless browser resolution for JavaScript-heavy pages
+* Optional heuristic metadata resolution
+* Custom User-Agent support
+* Custom request header support
 
-
+---
 
 ## Requirements
 
-- Bash
-- curl
+### Required
 
-Most Linux systems already include both.
+* `GNU Operating System / H-Linux`
+* `Human Command Layer`
+* `H-Linux env library`
+* `Hash`
+* `curl`
 
+### Optional (1)
 
-If curl is missing:
+* `python3`
 
-boxforge install curl
+Python is not explicitly required, however it greatly improves accuracy for:
 
+* UDI joining
+* Relative UDI resolution
+* HTML entity decoding
+* JavaScript escape decoding
+* Multiline HTML redirect extraction
 
+### Optional (2)
 
-## Installation
+For headless browser mode:
 
-Option 1 — ScriptForge
+* Python playwright package
+* Chromium installed via Playwright
 
-scriptforge
+---
 
-/home/yourname/
+## Execution
 
-Select peelback for installation to /usr/bin/peelback
+```bash
+> gh repo clone fpucore/peelback
 
-Then run:
+> goto peelback
 
-peelback https://example.com
+> make-executable peelback.hash
 
+> $here/peelback.hash
+```
 
-
-Option 2 — Manual install
-
-git clone https://github.com/fpucore/peelback.git
-
-cd peelback
-
-chmod +x peelback
-
-Then run:
-
-./peelback https://example.com
-
-
-
-Option 3 — Run locally
-
-chmod +x peelback
-
-./peelback https://example.com
-
-
-
-## Usage
-
-peelback [OPTIONS] <url>
-
-
-### Options
-
--v, --verbose        Show full redirect chain with status codes  
--f, --file <file>    Resolve URLs from a file  
--m, --max <num>      Maximum redirects to follow (default: 30)  
--t, --timeout <sec>  Connection timeout in seconds (default: 10)  
--H, --headers        Show response headers from the final destination  
--j, --json           Output results in JSON format  
--h, --help           Show help message  
-
-
-
-## Examples
-
-Resolve a shortened URL
-
-peelback https://bit.ly/abc123
-
-Example output:
-
-https://bit.ly/abc123
-
-  → https://example.com/article  [200, 3 layer(s) peeled]
-
-
-
-Show the full redirect chain
-
-peelback -v https://t.co/example
-
-Example output:
-
-Peeling: https://t.co/example
-
-────────────────────────────────────────
-
-Layer 0: [301] https://t.co/example
-
-Layer 1: [302] https://example.org/redirect
-
-Layer 2: [200] https://example.com/article
-
-────────────────────────────────────────
-
-Core URL:     https://example.com/article
-
-Status Code:  200
-
-Layers:       2
-
-
-
-Resolve URLs from a file
-
-urls.txt
-
-https://bit.ly/abc
-
-https://t.co/xyz
-
-https://example.com
-
-Run:
-
-peelback -f urls.txt
-
-
-
-Pipe URLs into Peel Back
-
-echo "https://bit.ly/abc" | peelback -
-
-or
-
-cat urls.txt | peelback -
-
-
-
-JSON output for scripts
-
-peelback -j https://bit.ly/abc
-
-Example output:
-
-{
-
-  "original":"https://bit.ly/abc",
-
-  "resolved":"https://example.com/article",
-
-  "status":200,
-
-  "layers":3,
-
-  "soft_redirect":false
-
-}
-
-
-
-Show final response headers
-
-peelback -H https://bit.ly/abc
-
-
-
-## How It Works
-
-Peel Back uses curl to:
-
-1. Follow HTTP redirects
-2. Capture response headers and bodies
-3. Detect client-side redirects embedded in HTML
-4. Continue resolving until the true destination is reached
-
-
-Soft redirects are detected using pattern matching for:
-
-- meta refresh
-- window.location
-- og:url
-- canonical
-- redirect titles used by some services
-
-
-
-## Use Cases
-
-Peel Back is useful for:
-
-- Investigating shortened URLs
-- Verifying tracking links
-- Auditing affiliate redirects
-- Security research
-- Automation scripts
-- Understanding complex redirect chains
-
-
-
-## License
-
-MIT License
-
-
-
-## Author
-
-Chris McGimpsey-Jones  
-chrismcgimpseyjones@duck.com
+Peel Back can also be installed using ScriptForge.

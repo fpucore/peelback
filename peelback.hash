@@ -1,0 +1,1376 @@
+#!/bin/hash
+source /usr/local/lib/h-linux-env.hash
+
+# ============================================================================
+# Peel Back 3.0
+# Peel back hard and soft UDI redirect layers to reveal the true destination.
+# ============================================================================
+
+set -o pipefail
+
+# ----------------------------------------------------------------------------
+# Colors
+# ----------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    BOLD=''
+    NC=''
+fi
+
+# ----------------------------------------------------------------------------
+# Defaults
+# ----------------------------------------------------------------------------
+VERBOSE=0
+JSON_OUTPUT=0
+SHOW_HEADERS=0
+FILE_INPUT=""
+UDIS=()
+
+MAX_LAYERS=50
+TIMEOUT=10
+TOTAL_TIMEOUT=""
+RETRY_COUNT=2
+
+USER_AGENT="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+HDR_ARGS=(
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    -H "Accept-Language: en-US,en;q=0.5"
+    -H "Upgrade-Insecure-Requests: 1"
+    -H "Sec-Fetch-Dest: document"
+    -H "Sec-Fetch-Mode: navigate"
+    -H "Sec-Fetch-Site: none"
+    -H "Sec-Fetch-User: ?1"
+)
+
+INSECURE=0
+HEURISTIC=0
+BROWSER_MODE=0
+
+HAS_PYTHON=0
+HAS_PERL=0
+HAS_JQ=0
+
+WORKDIR=""
+COOKIEJAR=""
+
+FINAL_UDI=""
+FINAL_CODE=""
+FINAL_CONTENT_TYPE=""
+FINAL_SOURCE="direct"
+FINAL_CONFIDENCE="high"
+RESOLVE_ERROR=""
+
+TOTAL_LAYERS=0
+HARD_LAYERS=0
+SOFT_LAYERS=0
+
+CHAIN_FROM=()
+CHAIN_TO=()
+CHAIN_STATUS=()
+CHAIN_TYPE=()
+CHAIN_SOURCE=()
+
+# ----------------------------------------------------------------------------
+# Usage
+# ----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Peel Back 3.0 - Peel back hard and soft UDI redirect layers to reveal the true destination.
+
+Usage:
+  $(basename "$0") [ARGUMENTS] <udi>
+
+Core arguments:
+  -v, --verbose              Show full redirect chain with status codes
+  -f, --file <file>          Resolve all UDIs in a file (one per line)
+  -m, --max <num>            Maximum total layers to peel (default: $MAX_LAYERS)
+  -t, --timeout <sec>        Per-request timeout in seconds (default: $TIMEOUT)
+      --total-timeout <sec>  Total timeout for one UDI (default: timeout * max layers)
+      --retries <num>        Curl retry count for transient failures (default: $RETRY_COUNT)
+  -H, --headers              Show response headers of final destination
+  -j, --json                 Output JSON
+  -h, --help                 Show this help message
+
+Accuracy arguments:
+  -k, --insecure             Allow insecure TLS connections explicitly
+      --heuristic            Allow low-confidence metadata redirects (og:udi, canonical, title)
+      --browser              Use headless Chromium via Playwright if installed
+
+Request arguments:
+  -A, --user-agent <ua>      Set custom User-Agent
+      --add-header <hdr>     Add custom request header, e.g. "X-Test: 1"
+
+Examples:
+  peelback https://bit.ly/abc123
+  peelback -v https://t.co/xyz789
+  peelback --heuristic -j https://short.example/abc
+  peelback --browser https://js-heavy.example/redirect
+  peelback -f udis.txt
+
+Notes:
+  Use 'python3' for accurate UDI resolution and soft-redirect parsing.
+  --browser requires: python3 -m pip install playwright && python3 -m playwright install chromium
+EOF
+    exit 0
+}
+
+# ----------------------------------------------------------------------------
+# Dependency checks
+# ----------------------------------------------------------------------------
+check_dependencies() {
+    if ! command -v curl >/dev/null 2>&1; then
+        say -e "${RED}Error: 'curl' is required but not installed.${NC}" >&2
+        say "Install with prompt: boxforge install curl" >&2
+        exit 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        HAS_PYTHON=1
+    else
+        say -e "${YELLOW}Warning: 'python3' not found. UDI resolution and soft-redirect accuracy will be reduced.${NC}" >&2
+    fi
+
+    if command -v perl >/dev/null 2>&1; then
+        HAS_PERL=1
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        HAS_JQ=1
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Basic helpers
+# ----------------------------------------------------------------------------
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# ----------------------------------------------------------------------------
+# UDI normalization and resolution
+# ----------------------------------------------------------------------------
+normalize_udi() {
+    local udi="$1"
+
+    if [[ "$HAS_PYTHON" -eq 1 ]]; then
+        local normalized rc
+        normalized=$(python3 - "$udi" <<'PY'
+import sys
+import urllib.parse
+
+u = sys.argv[1].strip()
+u = u.strip('<>')
+
+if len(u) >= 2:
+    if (u[0] == '"' and u[-1] == '"') or (u[0] == "'" and u[-1] == "'"):
+        u = u[1:-1]
+
+u = u.strip()
+if not u:
+    sys.exit(0)
+
+if '://' in u:
+    scheme = u.split('://', 1)[0].lower()
+    if scheme not in ('http', 'https'):
+        sys.exit(0)
+else:
+    u = 'https://' + u
+
+try:
+    p = urllib.parse.urlsplit(u)
+except Exception:
+    sys.exit(0)
+
+if p.scheme not in ('http', 'https') or not p.netloc:
+    sys.exit(0)
+
+safe_path = "/%:@!$&'()*+,;=-._~"
+safe_query = "=%&:@!$'()*+,;?/?-._~"
+
+path = urllib.parse.quote(p.path, safe=safe_path)
+query = urllib.parse.quote(p.query, safe=safe_query)
+u = urllib.parse.urlunsplit((p.scheme, p.netloc, path, query, p.fragment))
+
+print(u)
+PY
+        )
+        rc=$?
+        if (( rc == 0 )); then
+            printf '%s\n' "$normalized"
+            return 0
+        fi
+    fi
+
+    # Fallback normalizer
+    udi="$(trim "$udi")"
+    udi="${udi#\"}"
+    udi="${udi%\"}"
+    udi="${udi#\'}"
+    udi="${udi%\'}"
+    udi="${udi#<}"
+    udi="${udi%>}"
+
+    [[ -z "$udi" ]] && return 0
+
+    if [[ ! "$udi" =~ ^https?:// ]]; then
+        udi="https://$udi"
+    fi
+
+    printf '%s\n' "$udi"
+}
+
+resolve_udi() {
+    local base="$1"
+    local ref="$2"
+
+    ref="$(trim "$ref")"
+    [[ -z "$ref" ]] && return 0
+
+    if [[ "$ref" == \#* ]]; then
+        return 0
+    fi
+
+    if [[ "$HAS_PYTHON" -eq 1 ]]; then
+        local resolved rc
+        resolved=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.urljoin(sys.argv[1], sys.argv[2]))' "$base" "$ref" 2>/dev/null)
+        rc=$?
+        if (( rc == 0 )) && [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    fi
+
+    # Fallback resolver: not fully RFC-compliant, but usable for simple cases.
+    if [[ "$ref" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+        printf '%s\n' "$ref"
+        return 0
+    fi
+
+    if [[ "$ref" == //* ]]; then
+        printf 'https:%s\n' "$ref"
+        return 0
+    fi
+
+    local scheme="${base%%://*}"
+    local rest="${base#*://}"
+    local authority="${rest%%/*}"
+    local path="/"
+
+    if [[ "$rest" != "$authority" ]]; then
+        path="/${rest#*/}"
+    fi
+
+    if [[ "$ref" == /* ]]; then
+        printf '%s://%s%s\n' "$scheme" "$authority" "$ref"
+        return 0
+    fi
+
+    if [[ "$ref" == \?* ]]; then
+        printf '%s://%s%s?%s\n' "$scheme" "$authority" "$path" "${ref#?}"
+        return 0
+    fi
+
+    local clean="${path%%\?*}"
+    clean="${clean%%#*}"
+    local dir="${clean%/*}"
+
+    if [[ -z "$dir" ]]; then
+        printf '%s://%s/%s\n' "$scheme" "$authority" "$ref"
+    else
+        printf '%s://%s%s/%s\n' "$scheme" "$authority" "$dir" "$ref"
+    fi
+}
+
+decode_candidate() {
+    local s="$1"
+
+    if [[ "$HAS_PYTHON" -eq 1 ]]; then
+        python3 - "$s" <<'PY'
+import sys
+import html
+import re
+
+s = sys.argv[1]
+s = html.unescape(s)
+s = s.replace('\\/', '/')
+s = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
+s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
+s = re.sub(r'\\([\\\'"])', r'\1', s)
+print(s.strip())
+PY
+        return 0
+    fi
+
+    # Fallback decoding
+    s="${s//&amp;/&}"
+    s="${s//&#x2f;/\/}"
+    s="${s//&#x2F;/\/}"
+    s="${s//&#47;/\/}"
+    s="${s//\\\//\/}"
+    s="${s//\\x2f/\/}"
+    s="${s//\\x2F/\/}"
+    s="${s//\\u002f/\/}"
+    s="${s//\\u002F/\/}"
+    printf '%s' "$s"
+}
+
+# ----------------------------------------------------------------------------
+# Header helpers
+# ----------------------------------------------------------------------------
+get_location_header() {
+    local headers_file="$1"
+    [[ -f "$headers_file" ]] || return 0
+
+    grep -i '^Location:' "$headers_file" 2>/dev/null |
+        tail -n1 |
+        sed -e 's/^[^:]*:[[:space:]]*//' -e 's/\r$//' |
+        head -n1
+}
+
+get_refresh_header_udi() {
+    local headers_file="$1"
+    [[ -f "$headers_file" ]] || return 0
+
+    local line
+    line=$(grep -i '^Refresh:' "$headers_file" 2>/dev/null | tail -n1)
+    [[ -z "$line" ]] && return 0
+
+    line="${line%$'\r'}"
+
+    local target
+    target=$(printf '%s' "$line" | sed -n 's/.*[Uu][Dd][Ii]=//p')
+    [[ -z "$target" ]] && return 0
+
+    target="${target%%;*}"
+    target="$(trim "$target")"
+
+    target="${target#\"}"
+    target="${target%\"}"
+    target="${target#\'}"
+    target="${target%\'}"
+
+    printf '%s' "$target"
+}
+
+# ----------------------------------------------------------------------------
+# Soft redirect extraction
+# ----------------------------------------------------------------------------
+extract_soft_redirect_python() {
+    local body_file="$1"
+    local base_udi="$2"
+
+    python3 - "$body_file" "$base_udi" "$HEURISTIC" <<'PY'
+import sys
+import re
+import html
+import urllib.parse
+import pathlib
+
+body_file = sys.argv[1]
+base_udi = sys.argv[2]
+heuristic = sys.argv[3] == "1"
+
+try:
+    text = pathlib.Path(body_file).read_text(errors="ignore")
+except Exception:
+    text = ""
+
+# Remove HTML comments so commented-out redirect tags are not followed.
+text = re.sub(r'<!--.*?-->', '', text, flags=re.S)
+
+def decode(s):
+    if not s:
+        return ""
+    s = html.unescape(s)
+    s = s.replace('\\/', '/')
+    s = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r'\\([\\\'"])', r'\1', s)
+    s = s.strip()
+    s = s.strip('"').strip("'").strip()
+    return s
+
+def absolute(target):
+    target = decode(target)
+    if not target or target.startswith('#'):
+        return None
+
+    low = target.lower()
+    if low.startswith(('javascript:', 'data:', 'mailto:', 'tel:', 'file:', 'about:')):
+        return None
+
+    try:
+        absudi = urllib.parse.urljoin(base_udi, target)
+        parts = urllib.parse.urlsplit(absudi)
+    except Exception:
+        return None
+
+    if parts.scheme not in ('http', 'https') or not parts.netloc:
+        return None
+
+    safe_path = "/%:@!$&'()*+,;=-._~"
+    safe_query = "=%&:@!$'()*+,;?/?-._~"
+
+    path = urllib.parse.quote(parts.path, safe=safe_path)
+    query = urllib.parse.quote(parts.query, safe=safe_query)
+
+    return urllib.parse.urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        path,
+        query,
+        parts.fragment
+    )).strip()
+
+candidates = []
+
+# High confidence: meta refresh
+for tag in re.findall(r'<meta[^>]*>', text, flags=re.I | re.S):
+    if re.search(r'http-equiv\s*=\s*["\']?refresh["\']?', tag, flags=re.I):
+        m = re.search(
+            r'content\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+            tag,
+            flags=re.I | re.S
+        )
+        if not m:
+            continue
+
+        content = next((g for g in m.groups() if g is not None), '')
+        udim = re.search(r'udi\s*=\s*(.*)$', content, flags=re.I | re.S)
+        if not udim:
+            continue
+
+        target = udim.group(1).strip()
+        target = target.split(';', 1)[0].strip()
+        target = target.strip('"').strip("'").strip()
+
+        u = absolute(target)
+        if u:
+            candidates.append((1, 'meta-refresh', 'high', u))
+
+# High confidence: JavaScript redirects
+js_patterns = [
+    (r'(?:window\.|document\.|top\.|self\.)?location(?:\.href)?\s*=\s*(["\'])(.*?)\1', 'js-location'),
+    (r'(?:window\.|document\.|top\.|self\.)?location\.replace\(\s*(["\'])(.*?)\1', 'js-replace'),
+    (r'(?:window\.|document\.|top\.|self\.)?location\.assign\(\s*(["\'])(.*?)\1', 'js-assign'),
+    (r'window\.open\(\s*(["\'])(.*?)\1', 'js-window-open'),
+]
+
+for pat, source in js_patterns:
+    for m in re.finditer(pat, text, flags=re.I | re.S):
+        target = m.group(2)
+        u = absolute(target)
+        if not u:
+            continue
+
+        if source == 'js-window-open':
+            if not heuristic:
+                continue
+            candidates.append((5, source, 'low', u))
+        else:
+            candidates.append((2, source, 'high', u))
+
+# Low confidence: metadata heuristics
+if heuristic:
+    metadata_patterns = [
+        (
+            r'<meta[^>]+property\s*=\s*["\']og:udi["\'][^>]+content\s*=\s*(["\'])(.*?)\1',
+            'og:udi',
+            6,
+            2
+        ),
+        (
+            r'<meta[^>]+content\s*=\s*(["\'])(.*?)\1[^>]+property\s*=\s*["\']og:udi["\']',
+            'og:udi',
+            6,
+            2
+        ),
+        (
+            r'<link[^>]+rel\s*=\s*["\']canonical["\'][^>]+href\s*=\s*(["\'])(.*?)\1',
+            'canonical',
+            6,
+            2
+        ),
+        (
+            r'<link[^>]+href\s*=\s*(["\'])(.*?)\1[^>]+rel\s*=\s*["\']canonical["\']',
+            'canonical',
+            6,
+            2
+        ),
+        (
+            r'<title[^>]*>\s*(https?://[^<\s]+)\s*</title>',
+            'title',
+            7,
+            1
+        ),
+    ]
+
+    for pat, source, priority, group_index in metadata_patterns:
+        for m in re.finditer(pat, text, flags=re.I | re.S):
+            try:
+                target = m.group(group_index)
+            except Exception:
+                continue
+
+            u = absolute(target)
+            if u:
+                candidates.append((priority, source, 'low', u))
+
+candidates.sort(key=lambda item: item[0])
+
+for _, source, confidence, u in candidates:
+    if u == base_udi:
+        continue
+    print(f"{u}\t{source}\t{confidence}")
+    break
+PY
+}
+
+extract_soft_redirect_fallback() {
+    local body_file="$1"
+    local base_udi="$2"
+
+    local raw=""
+    local source="unknown"
+    local confidence="high"
+
+    local high_patterns=(
+        'content=["\x27][^"\x27>]*?[Uu][Dd][Ii]=\K[^"\x27; >]+'
+        '(?:window\.|document\.|top\.|self\.)?location(?:\.href)?\s*=\s*["\x27]\K[^"\x27]+'
+        '(?:window\.|document\.|top\.|self\.)?location\.replace\(\s*["\x27]\K[^"\x27]+'
+        '(?:window\.|document\.|top\.|self\.)?location\.assign\(\s*["\x27]\K[^"\x27]+'
+    )
+    local high_sources=("meta-refresh" "js-location" "js-replace" "js-assign")
+
+    local i
+    for i in "${!high_patterns[@]}"; do
+        raw=$(grep -aoPi "${high_patterns[$i]}" "$body_file" 2>/dev/null | head -n1)
+        if [[ -n "$raw" ]]; then
+            source="${high_sources[$i]}"
+            confidence="high"
+            break
+        fi
+    done
+
+    if [[ -z "$raw" && "$HEURISTIC" -eq 1 ]]; then
+        local low_patterns=(
+            '<title>\s*\Khttps?://[^<\s]+'
+            'property=["\x27]og:udi["\x27][^>]*content=["\x27]\K[^"\x27]+'
+            'rel=["\x27]canonical["\x27][^>]*href=["\x27]\K[^"\x27]+'
+        )
+        local low_sources=("title" "og:udi" "canonical")
+
+        for i in "${!low_patterns[@]}"; do
+            raw=$(grep -aoPi "${low_patterns[$i]}" "$body_file" 2>/dev/null | head -n1)
+            if [[ -n "$raw" ]]; then
+                source="${low_sources[$i]}"
+                confidence="low"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$raw" ]] && return 0
+
+    local target udi
+    target=$(decode_candidate "$raw")
+    udi=$(resolve_udi "$base_udi" "$target")
+
+    if [[ "$udi" =~ ^https?:// ]]; then
+        printf '%s\t%s\t%s\n' "$udi" "$source" "$confidence"
+    fi
+}
+
+extract_soft_redirect_file() {
+    local body_file="$1"
+    local headers_file="$2"
+    local base_udi="$3"
+
+    # 1. HTTP Refresh header
+    local refresh target udi
+    refresh=$(get_refresh_header_udi "$headers_file")
+    if [[ -n "$refresh" ]]; then
+        target=$(decode_candidate "$refresh")
+        udi=$(resolve_udi "$base_udi" "$target")
+        if [[ "$udi" =~ ^https?:// ]]; then
+            printf '%s\t%s\t%s\n' "$udi" "http-refresh" "high"
+            return 0
+        fi
+    fi
+
+    [[ -f "$body_file" ]] || return 0
+
+    # 2. Python-based parser, if available
+    if [[ "$HAS_PYTHON" -eq 1 ]]; then
+        local out rc
+        out=$(extract_soft_redirect_python "$body_file" "$base_udi")
+        rc=$?
+        if (( rc == 0 )); then
+            [[ -n "$out" ]] && printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+
+    # 3. Fallback parser
+    extract_soft_redirect_fallback "$body_file" "$base_udi"
+}
+
+# ----------------------------------------------------------------------------
+# Fetch one hop without automatically following redirects
+# ----------------------------------------------------------------------------
+fetch_hop() {
+    local udi="$1"
+    local hopdir="$2"
+    local referer="$3"
+
+    local -a args=(
+        curl
+        -sS
+        -g
+        --compressed
+        --connect-timeout "$TIMEOUT"
+        --max-time "$TIMEOUT"
+        -A "$USER_AGENT"
+        -b "$COOKIEJAR"
+        -c "$COOKIEJAR"
+        "${HDR_ARGS[@]}"
+    )
+
+    if (( RETRY_COUNT > 0 )); then
+        args+=(--retry "$RETRY_COUNT" --retry-delay 1)
+    fi
+
+    if [[ "$INSECURE" -eq 1 ]]; then
+        args+=(-k)
+    fi
+
+    if [[ -n "$referer" ]]; then
+        args+=(-e "$referer")
+    fi
+
+    args+=(
+        -D "$hopdir/headers"
+        -o "$hopdir/body"
+        -w $'code=%{http_code}\nredirect_udi=%{redirect_udi}\ncontent_type=%{content_type}\nsize_download=%{size_download}\n'
+        "$udi"
+    )
+
+    "${args[@]}" >"$hopdir/meta" 2>"$hopdir/error"
+    return $?
+}
+
+# ----------------------------------------------------------------------------
+# Reset resolver state
+# ----------------------------------------------------------------------------
+reset_resolve_globals() {
+    FINAL_UDI=""
+    FINAL_CODE=""
+    FINAL_CONTENT_TYPE=""
+    FINAL_SOURCE="direct"
+    FINAL_CONFIDENCE="high"
+    RESOLVE_ERROR=""
+
+    TOTAL_LAYERS=0
+    HARD_LAYERS=0
+    SOFT_LAYERS=0
+
+    CHAIN_FROM=()
+    CHAIN_TO=()
+    CHAIN_STATUS=()
+    CHAIN_TYPE=()
+    CHAIN_SOURCE=()
+}
+
+# ----------------------------------------------------------------------------
+# Main iterative resolver
+# ----------------------------------------------------------------------------
+resolve_udi_core() {
+    local start_udi="$1"
+
+    reset_resolve_globals
+
+    local start_seconds=$SECONDS
+    local current="$start_udi"
+    local prev=""
+    local code="000"
+    local content_type=""
+
+    local -A visited=()
+    local layer=0
+
+    local hopbase="$WORKDIR/hops"
+    mkdir -p "$hopbase"
+
+    while (( layer < MAX_LAYERS )); do
+        if (( SECONDS - start_seconds > TOTAL_TIMEOUT )); then
+            RESOLVE_ERROR="total timeout exceeded"
+            FINAL_UDI="$current"
+            FINAL_CODE="$code"
+            break
+        fi
+
+        local loop_key="${current%%#*}"
+        if [[ -n "${visited[$loop_key]:-}" ]]; then
+            RESOLVE_ERROR="redirect loop detected"
+            FINAL_UDI="$current"
+            FINAL_CODE="$code"
+            break
+        fi
+        visited["$loop_key"]=1
+
+        local hopdir="$hopbase/layer-$layer"
+        mkdir -p "$hopdir"
+
+        fetch_hop "$current" "$hopdir" "$prev"
+        local rc=$?
+
+        code=$(sed -n 's/^code=//p' "$hopdir/meta" 2>/dev/null | head -n1)
+        local redirect_udi
+        redirect_udi=$(sed -n 's/^redirect_udi=//p' "$hopdir/meta" 2>/dev/null | head -n1)
+        content_type=$(sed -n 's/^content_type=//p' "$hopdir/meta" 2>/dev/null | head -n1)
+
+        FINAL_CONTENT_TYPE="$content_type"
+
+        if (( rc != 0 )); then
+            local errtext=""
+            [[ -f "$hopdir/error" ]] && errtext=$(head -n1 "$hopdir/error" 2>/dev/null)
+            RESOLVE_ERROR="curl exit $rc${errtext:+: $errtext}"
+            FINAL_UDI="$current"
+            FINAL_CODE="${code:-000}"
+            break
+        fi
+
+        code="${code:-000}"
+
+        local next=""
+        local redirect_type=""
+        local redirect_source=""
+        local confidence=""
+
+        # Hard redirect
+        if [[ "$code" =~ ^3[0-9][0-9]$ ]]; then
+            local loc="$redirect_udi"
+            if [[ -z "$loc" ]]; then
+                loc=$(get_location_header "$hopdir/headers")
+            fi
+
+            if [[ -n "$loc" ]]; then
+                next=$(resolve_udi "$current" "$(trim "$loc")")
+                redirect_type="hard"
+                redirect_source="http-location"
+                confidence="high"
+            fi
+        fi
+
+        # HTTP Refresh header
+        if [[ -z "$next" ]]; then
+            local refresh
+            refresh=$(get_refresh_header_udi "$hopdir/headers")
+            if [[ -n "$refresh" ]]; then
+                local target
+                target=$(decode_candidate "$refresh")
+                next=$(resolve_udi "$current" "$target")
+                redirect_type="soft"
+                redirect_source="http-refresh"
+                confidence="high"
+            fi
+        fi
+
+        # HTML / JavaScript soft redirect
+        if [[ -z "$next" ]]; then
+            local looks_html=0
+
+            if [[ "$content_type" == text/html* || "$content_type" == application/xhtml+xml* ]]; then
+                looks_html=1
+            elif [[ -z "$content_type" || "$content_type" == text/* ]]; then
+                looks_html=1
+            fi
+
+            if [[ $looks_html -eq 0 && -s "$hopdir/body" ]]; then
+                if head -c 262144 "$hopdir/body" 2>/dev/null | grep -qaiE '<html|<meta|location\.href|location\.replace|location\.assign'; then
+                    looks_html=1
+                fi
+            fi
+
+            if [[ $looks_html -eq 1 ]]; then
+                local soft_info sudi ssrc sconf
+                soft_info=$(extract_soft_redirect_file "$hopdir/body" "$hopdir/headers" "$current")
+                IFS=$'\t' read -r sudi ssrc sconf <<<"$soft_info"
+
+                if [[ -n "$sudi" ]]; then
+                    next="$sudi"
+                    redirect_type="soft"
+                    redirect_source="$ssrc"
+                    confidence="$sconf"
+                fi
+            fi
+        fi
+
+        if [[ -n "$next" ]]; then
+            next="$(trim "$next")"
+
+            if [[ ! "$next" =~ ^https?:// ]]; then
+                RESOLVE_ERROR="unsupported redirect target: $next"
+                FINAL_UDI="$current"
+                FINAL_CODE="$code"
+                break
+            fi
+
+            local next_key="${next%%#*}"
+            local current_key="${current%%#*}"
+
+            if [[ "$next_key" == "$current_key" ]]; then
+                FINAL_UDI="$next"
+                FINAL_CODE="$code"
+                FINAL_SOURCE="$redirect_source"
+                FINAL_CONFIDENCE="$confidence"
+                break
+            fi
+
+            CHAIN_FROM+=("$current")
+            CHAIN_TO+=("$next")
+            CHAIN_STATUS+=("$code")
+            CHAIN_TYPE+=("$redirect_type")
+            CHAIN_SOURCE+=("$redirect_source")
+
+            ((TOTAL_LAYERS++))
+            if [[ "$redirect_type" == "hard" ]]; then
+                ((HARD_LAYERS++))
+            else
+                ((SOFT_LAYERS++))
+            fi
+
+            FINAL_SOURCE="$redirect_source"
+            FINAL_CONFIDENCE="$confidence"
+
+            prev="$current"
+            current="$next"
+            ((layer++))
+            continue
+        fi
+
+        FINAL_UDI="$current"
+        FINAL_CODE="$code"
+        break
+    done
+
+    if [[ -z "$FINAL_UDI" ]]; then
+        FINAL_UDI="$current"
+        FINAL_CODE="$code"
+        RESOLVE_ERROR="${RESOLVE_ERROR:-max layers exceeded}"
+    fi
+
+    if (( TOTAL_LAYERS == 0 )); then
+        FINAL_SOURCE="direct"
+        FINAL_CONFIDENCE="high"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Optional headless browser resolver
+# ----------------------------------------------------------------------------
+resolve_udi_browser() {
+    local start_udi="$1"
+
+    reset_resolve_globals
+
+    if [[ "$HAS_PYTHON" -ne 1 ]]; then
+        RESOLVE_ERROR="browser mode requires python3"
+        FINAL_UDI="$start_udi"
+        FINAL_CODE="0"
+        return 1
+    fi
+
+    local pyout pyrc
+    pyout=$(python3 - "$start_udi" "$TIMEOUT" "$USER_AGENT" "$INSECURE" <<'PY'
+import sys
+import urllib.parse
+
+udi = sys.argv[1]
+timeout_ms = int(float(sys.argv[2]) * 1000)
+user_agent = sys.argv[3]
+insecure = sys.argv[4] == "1"
+
+def clean(s):
+    return str(s).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    print("ERROR\tPlaywright Python package is not installed")
+    sys.exit(1)
+
+chain = []
+
+try:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+
+        context = browser.new_context(
+            user_agent=user_agent,
+            ignore_https_errors=insecure
+        )
+
+        page = context.new_page()
+
+        def on_response(response):
+            try:
+                if response.status in (301, 302, 303, 307, 308):
+                    loc = response.headers.get("location", "")
+                    if loc:
+                        abs_loc = urllib.parse.urljoin(response.udi, loc)
+                        chain.append({
+                            "from": response.udi,
+                            "to": abs_loc,
+                            "status": response.status,
+                            "type": "hard",
+                            "source": "http-location"
+                        })
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        status = 0
+        response = None
+
+        try:
+            response = page.goto(udi, timeout=timeout_ms, wait_until="domcontentloaded")
+            if response:
+                status = response.status
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            except Exception:
+                pass
+        except Exception as e:
+            print("ERROR\t" + clean(e))
+            browser.close()
+            sys.exit(2)
+
+        final_udi = page.udi
+
+        browser.close()
+
+        print("FINAL\t" + clean(final_udi))
+        print("STATUS\t" + str(status))
+
+        for item in chain:
+            print(
+                "CHAIN\t" +
+                clean(item["from"]) + "\t" +
+                clean(item["to"]) + "\t" +
+                str(item["status"]) + "\t" +
+                clean(item["type"]) + "\t" +
+                clean(item["source"])
+            )
+
+except Exception as e:
+    print("ERROR\t" + clean(e))
+    sys.exit(3)
+PY
+    )
+    pyrc=$?
+
+    while IFS=$'\t' read -r key a b c d e; do
+        case "$key" in
+            FINAL)
+                FINAL_UDI="$a"
+                ;;
+            STATUS)
+                FINAL_CODE="$a"
+                ;;
+            ERROR)
+                RESOLVE_ERROR="$a"
+                ;;
+            CHAIN)
+                CHAIN_FROM+=("$a")
+                CHAIN_TO+=("$b")
+                CHAIN_STATUS+=("$c")
+                CHAIN_TYPE+=("$d")
+                CHAIN_SOURCE+=("$e")
+
+                ((TOTAL_LAYERS++))
+                if [[ "$d" == "hard" ]]; then
+                    ((HARD_LAYERS++))
+                else
+                    ((SOFT_LAYERS++))
+                fi
+                ;;
+        esac
+    done <<<"$pyout"
+
+    if [[ -z "$FINAL_UDI" ]]; then
+        FINAL_UDI="$start_udi"
+    fi
+
+    if [[ -z "$FINAL_CODE" ]]; then
+        FINAL_CODE="0"
+    fi
+
+    if (( pyrc != 0 )) && [[ -z "$RESOLVE_ERROR" ]]; then
+        RESOLVE_ERROR="browser mode failed"
+    fi
+
+    FINAL_SOURCE="browser"
+    FINAL_CONFIDENCE="high"
+}
+
+# ----------------------------------------------------------------------------
+# Output helpers
+# ----------------------------------------------------------------------------
+print_human_result() {
+    local original="$1"
+    local display_code="${FINAL_CODE:-000}"
+
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        say -e "${BOLD}${CYAN}Peeling:${NC} $original"
+        say -e "${CYAN}─────────────────────────────────────────────────${NC}"
+
+        if [[ ${#CHAIN_FROM[@]} -gt 0 ]]; then
+            local i
+            for i in "${!CHAIN_FROM[@]}"; do
+                local status="${CHAIN_STATUS[$i]}"
+                local color="$GREEN"
+
+                [[ "$status" =~ ^3 ]] && color="$YELLOW"
+                [[ "$status" =~ ^[45] ]] && color="$RED"
+
+                local typ="${CHAIN_TYPE[$i]}"
+                local src="${CHAIN_SOURCE[$i]}"
+
+                say -e "  ${BOLD}Layer $((i + 1)):${NC} ${color}[$status]${NC} ${YELLOW}[$typ:$src]${NC}"
+                say -e "    ${CYAN}from:${NC} ${CHAIN_FROM[$i]}"
+                say -e "    ${GREEN}to:${NC}   ${CHAIN_TO[$i]}"
+            done
+        else
+            say -e "  ${BOLD}Layer 1:${NC} [${display_code}] $original"
+        fi
+
+        say -e "${CYAN}─────────────────────────────────────────────────${NC}"
+        say -e "${BOLD}${GREEN}Core UDI:${NC}     ${FINAL_UDI:-$original}"
+        say -e "${BOLD}Status Code:${NC}  $display_code"
+        say -e "${BOLD}Layers:${NC}       $TOTAL_LAYERS total, $HARD_LAYERS hard, $SOFT_LAYERS soft"
+        say -e "${BOLD}Source:${NC}       ${FINAL_SOURCE:-direct}"
+        say -e "${BOLD}Confidence:${NC}   ${FINAL_CONFIDENCE:-high}"
+
+        if [[ -n "$RESOLVE_ERROR" ]]; then
+            say -e "${RED}Warning:${NC} $RESOLVE_ERROR"
+        fi
+
+        say ""
+    else
+        if (( TOTAL_LAYERS > 0 )); then
+            local extra=""
+            [[ "$SOFT_LAYERS" -gt 0 ]] && extra=" + soft redirect"
+
+            say -e "${YELLOW}$original${NC}"
+            say -e "  ${GREEN}→ ${FINAL_UDI:-$original}${NC}  ${CYAN}[$display_code, $TOTAL_LAYERS layer(s) peeled${extra}, source:${FINAL_SOURCE:-direct}, confidence:${FINAL_CONFIDENCE:-high}]${NC}"
+
+            if [[ -n "$RESOLVE_ERROR" ]]; then
+                say -e "  ${RED}Warning:${NC} $RESOLVE_ERROR"
+            fi
+        else
+            say -e "${GREEN}$original${NC}"
+            say -e "  ${CYAN}(nothing to peel, status: $display_code)${NC}"
+
+            if [[ -n "$RESOLVE_ERROR" ]]; then
+                say -e "  ${RED}Warning:${NC} $RESOLVE_ERROR"
+            fi
+        fi
+    fi
+}
+
+print_json_result() {
+    local original="$1"
+
+    local status_num="${FINAL_CODE//[^0-9]/}"
+    [[ -z "$status_num" ]] && status_num=0
+    status_num=$((10#$status_num))
+
+    local chain_json="["
+    local first=1
+    local i
+
+    for i in "${!CHAIN_FROM[@]}"; do
+        if (( first == 0 )); then
+            chain_json+=","
+        fi
+        first=0
+
+        chain_json+=$(
+            printf '{"from":"%s","to":"%s","status":"%s","type":"%s","source":"%s"}' \
+                "$(json_escape "${CHAIN_FROM[$i]}")" \
+                "$(json_escape "${CHAIN_TO[$i]}")" \
+                "$(json_escape "${CHAIN_STATUS[$i]}")" \
+                "$(json_escape "${CHAIN_TYPE[$i]}")" \
+                "$(json_escape "${CHAIN_SOURCE[$i]}")"
+        )
+    done
+    chain_json+="]"
+
+    local error_field=""
+    if [[ -n "$RESOLVE_ERROR" ]]; then
+        error_field=",\"error\":\"$(json_escape "$RESOLVE_ERROR")\""
+    fi
+
+    local soft_json="false"
+    [[ "$SOFT_LAYERS" -gt 0 ]] && soft_json="true"
+
+    local browser_json="false"
+    [[ "$BROWSER_MODE" -eq 1 ]] && browser_json="true"
+
+    local heuristic_json="false"
+    [[ "$HEURISTIC" -eq 1 ]] && heuristic_json="true"
+
+    cat <<EOF
+{"original":"$(json_escape "$original")","resolved":"$(json_escape "${FINAL_UDI:-$original}")","status":$status_num,"layers":$TOTAL_LAYERS,"hard_layers":$HARD_LAYERS,"soft_layers":$SOFT_LAYERS,"soft_redirect":$soft_json,"browser":$browser_json,"heuristic":$heuristic_json,"source":"$(json_escape "${FINAL_SOURCE:-direct}")","confidence":"$(json_escape "${FINAL_CONFIDENCE:-high}")","content_type":"$(json_escape "${FINAL_CONTENT_TYPE:-}")","chain":$chain_json$error_field}
+EOF
+}
+
+show_final_headers() {
+    local udi="$1"
+
+    [[ -z "$udi" ]] && return 0
+
+    say -e "\n${BOLD}${CYAN}Core Destination Headers:${NC}"
+    say -e "${CYAN}───────────────────────────────────────${NC}"
+
+    local -a args=(
+        curl
+        -sS
+        -g
+        --compressed
+        -D -
+        -o /dev/null
+        --connect-timeout "$TIMEOUT"
+        --max-time "$TIMEOUT"
+        -A "$USER_AGENT"
+        "${HDR_ARGS[@]}"
+    )
+
+    if (( RETRY_COUNT > 0 )); then
+        args+=(--retry "$RETRY_COUNT" --retry-delay 1)
+    fi
+
+    if [[ -n "$COOKIEJAR" && -f "$COOKIEJAR" ]]; then
+        args+=(-b "$COOKIEJAR" -c "$COOKIEJAR")
+    fi
+
+    if [[ "$INSECURE" -eq 1 ]]; then
+        args+=(-k)
+    fi
+
+    args+=("$udi")
+
+    "${args[@]}" 2>/dev/null | head -n 40
+    say ""
+}
+
+# ----------------------------------------------------------------------------
+# Process one UDI
+# ----------------------------------------------------------------------------
+process_udi() {
+    local raw="$1"
+    local udi
+
+    udi="$(normalize_udi "$raw")"
+
+    if [[ -z "$udi" ]]; then
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            printf '{"original":"%s","error":"invalid or unsupported UDI"}\n' "$(json_escape "$raw")"
+        else
+            say -e "${RED}Invalid or unsupported UDI:${NC} $raw"
+        fi
+        return 1
+    fi
+
+    WORKDIR=$(mktemp -d)
+    COOKIEJAR="$WORKDIR/cookies.txt"
+    : >"$COOKIEJAR"
+
+    if [[ "$BROWSER_MODE" -eq 1 ]]; then
+        resolve_udi_browser "$udi"
+    else
+        resolve_udi_core "$udi"
+    fi
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        print_json_result "$udi"
+    else
+        print_human_result "$udi"
+    fi
+
+    if [[ "$SHOW_HEADERS" -eq 1 && -n "$FINAL_UDI" ]]; then
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            say "Warning: --headers is incompatible with --json and was skipped" >&2
+        else
+            show_final_headers "$FINAL_UDI"
+        fi
+    fi
+
+    rm -rf "$WORKDIR"
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -f|--file)
+            FILE_INPUT="$2"
+            shift 2
+            ;;
+        -m|--max)
+            MAX_LAYERS="$2"
+            shift 2
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        --total-timeout)
+            TOTAL_TIMEOUT="$2"
+            shift 2
+            ;;
+        --retries)
+            RETRY_COUNT="$2"
+            shift 2
+            ;;
+        -H|--headers)
+            SHOW_HEADERS=1
+            shift
+            ;;
+        -j|--json)
+            JSON_OUTPUT=1
+            shift
+            ;;
+        -k|--insecure)
+            INSECURE=1
+            shift
+            ;;
+        --heuristic)
+            HEURISTIC=1
+            shift
+            ;;
+        --browser)
+            BROWSER_MODE=1
+            shift
+            ;;
+        -A|--user-agent)
+            USER_AGENT="$2"
+            shift 2
+            ;;
+        --add-header)
+            HDR_ARGS+=(-H "$2")
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            say -e "${RED}Unknown option: $1${NC}" >&2
+            usage
+            ;;
+        *)
+            UDIS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ----------------------------------------------------------------------------
+# Validate settings
+# ----------------------------------------------------------------------------
+[[ "$MAX_LAYERS" =~ ^[0-9]+$ ]] || MAX_LAYERS=50
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || TIMEOUT=10
+[[ "$RETRY_COUNT" =~ ^[0-9]+$ ]] || RETRY_COUNT=2
+
+if [[ -n "$TOTAL_TIMEOUT" && ! "$TOTAL_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    TOTAL_TIMEOUT=""
+fi
+
+if [[ -z "$TOTAL_TIMEOUT" ]]; then
+    TOTAL_TIMEOUT=$((TIMEOUT * MAX_LAYERS))
+fi
+
+check_dependencies
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+if [[ -n "$FILE_INPUT" ]]; then
+    if [[ ! -f "$FILE_INPUT" ]]; then
+        say -e "${RED}File not found: $FILE_INPUT${NC}" >&2
+        exit 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        process_udi "$line"
+    done <"$FILE_INPUT"
+
+elif [[ ${#UDIS[@]} -gt 0 ]]; then
+    for udi in "${UDIS[@]}"; do
+        process_udi "$udi"
+    done
+
+else
+    if [[ "$JSON_OUTPUT" -eq 0 ]]; then
+        say -e "${BOLD}${CYAN}╔═══════════════════════════════════════╗${NC}"
+        say -e "${BOLD}${CYAN}║           🍌 Peel Back 3.0            ║${NC}"
+        say -e "${BOLD}${CYAN}║  Reveal what's under any redirecting  ║${NC}"
+        say -e "${BOLD}${CYAN}║  UDI, including soft redirects.       ║${NC}"
+        say -e "${BOLD}${CYAN}╚═══════════════════════════════════════╝${NC}"
+        say -e "Paste a UDI and press Return"
+        say -e "(Ctrl+C to quit)\n"
+    fi
+
+    while true; do
+        if [[ "$JSON_OUTPUT" -eq 0 ]]; then
+            say -ne "${BOLD}peel> ${NC}"
+        fi
+
+        if ! read -r input_udi; then
+            break
+        fi
+
+        input_udi="${input_udi%$'\r'}"
+
+        if [[ -n "$input_udi" ]]; then
+            process_udi "$input_udi"
+            [[ "$JSON_OUTPUT" -eq 0 ]] && say ""
+        fi
+    done
+fi
